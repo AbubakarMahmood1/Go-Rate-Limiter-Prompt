@@ -3,25 +3,34 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: rate-limiter-service
+    init: true
     ports:
       - "8081:8080"
     environment:
-      - STORE=redis
-      - REDIS_ADDR=redis:6379
-      - GIN_MODE=release
+      STORE: redis
+      REDIS_ADDR: redis:6379
+      GIN_MODE: release
+      # Local demonstration only. Production deployments should source these
+      # from trusted configuration and use a strong secret for RESET_TOKEN.
+      ALLOW_POLICY_OVERRIDES: "${ALLOW_POLICY_OVERRIDES:-true}"
+      RESET_TOKEN: "${RESET_TOKEN:-local-development-reset-token}"
     depends_on:
       redis:
         condition: service_healthy
     networks:
       - rate-limiter
     restart: unless-stopped
+    stop_grace_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   redis:
-    image: redis:7.4-alpine
-    container_name: rate-limiter-redis
-    ports:
-      - "6379:6379"
+    image: redis:7.4.9-alpine3.21
     command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
@@ -35,33 +44,32 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.5.0
-    container_name: rate-limiter-prometheus
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
     depends_on:
-      - rate-limiter
+      rate-limiter:
+        condition: service_healthy
     networks:
       - rate-limiter
 
   grafana:
     image: grafana/grafana:12.2.0
-    container_name: rate-limiter-grafana
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
     networks:

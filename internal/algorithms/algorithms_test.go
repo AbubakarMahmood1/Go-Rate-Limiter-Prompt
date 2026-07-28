@@ -95,15 +95,155 @@ func TestTokenBucket_AllowNAllOrNothing(t *testing.T) {
 	assert.Equal(t, 0, res.Remaining)
 }
 
-func TestTokenBucket_InvalidCounts(t *testing.T) {
-	tb := algorithms.NewTokenBucket(newMemory(t), limiter.Config{Limit: 10, Window: time.Hour, Burst: 10})
+func TestAlgorithms_InvalidCounts(t *testing.T) {
 	ctx := context.Background()
+	cfg := limiter.Config{Limit: 10, Window: time.Hour, Burst: 10}
+	limiters := map[string]limiter.RateLimiter{
+		"token_bucket":   algorithms.NewTokenBucket(newMemory(t), cfg),
+		"sliding_window": algorithms.NewSlidingWindowCounter(newMemory(t), cfg),
+		"fixed_window":   algorithms.NewFixedWindowCounter(newMemory(t), cfg),
+	}
 
-	_, err := tb.AllowN(ctx, "k", -1)
-	assert.ErrorIs(t, err, limiter.ErrInvalidCount)
+	for name, instance := range limiters {
+		t.Run(name, func(t *testing.T) {
+			_, err := instance.AllowN(ctx, "k", -1)
+			assert.ErrorIs(t, err, limiter.ErrInvalidCount)
+			_, err = instance.AllowN(ctx, "k", 0)
+			assert.ErrorIs(t, err, limiter.ErrInvalidCount)
+			_, err = instance.AllowN(ctx, "k", 11)
+			assert.ErrorIs(t, err, limiter.ErrExceedsLimit)
+		})
+	}
+}
 
-	_, err = tb.AllowN(ctx, "k", 11)
-	assert.ErrorIs(t, err, limiter.ErrExceedsLimit)
+func TestAlgorithms_InvalidWindowFailsBeforeDecision(t *testing.T) {
+	ctx := context.Background()
+	cfg := limiter.Config{Limit: 10, Window: 0, Burst: 10}
+	limiters := map[string]limiter.RateLimiter{
+		"token_bucket":   algorithms.NewTokenBucket(newMemory(t), cfg),
+		"sliding_window": algorithms.NewSlidingWindowCounter(newMemory(t), cfg),
+		"fixed_window":   algorithms.NewFixedWindowCounter(newMemory(t), cfg),
+	}
+	for name, instance := range limiters {
+		t.Run(name, func(t *testing.T) {
+			_, err := instance.Allow(ctx, "k")
+			assert.ErrorIs(t, err, limiter.ErrInvalidStoreOperation)
+		})
+	}
+}
+
+type fixedDecisionStore struct {
+	window *limiter.WindowResult
+	tokens *limiter.TokenResult
+}
+
+func (s *fixedDecisionStore) IncrWindow(context.Context, string, time.Duration, int64, int64, bool, time.Duration) (*limiter.WindowResult, error) {
+	copy := *s.window
+	return &copy, nil
+}
+
+func (s *fixedDecisionStore) TakeTokens(context.Context, string, float64, float64, float64, time.Duration) (*limiter.TokenResult, error) {
+	copy := *s.tokens
+	return &copy, nil
+}
+
+func (*fixedDecisionStore) Delete(context.Context, string) error { return nil }
+func (*fixedDecisionStore) Ping(context.Context) error           { return nil }
+func (*fixedDecisionStore) Close() error                         { return nil }
+
+func TestTokenBucket_ResetAtUsesStoreClock(t *testing.T) {
+	backendNow := time.Date(2001, time.February, 3, 4, 5, 6, 0, time.UTC)
+	store := &fixedDecisionStore{tokens: &limiter.TokenResult{
+		Allowed: true,
+		Tokens:  5,
+		Now:     backendNow,
+	}}
+	tb := algorithms.NewTokenBucket(store, limiter.Config{Limit: 10, Window: time.Second, Burst: 10})
+
+	result, err := tb.Allow(context.Background(), "k")
+	require.NoError(t, err)
+	assert.Equal(t, backendNow.Add(500*time.Millisecond), result.ResetAt)
+}
+
+func TestTokenBucket_RetryRoundsUpToStoreClockTick(t *testing.T) {
+	backendNow := time.Date(2001, time.February, 3, 4, 5, 6, 0, time.UTC)
+	store := &fixedDecisionStore{tokens: &limiter.TokenResult{
+		Allowed: false,
+		Tokens:  0.9999996,
+		Now:     backendNow,
+	}}
+	tb := algorithms.NewTokenBucket(store, limiter.Config{Limit: 1, Window: time.Second, Burst: 1})
+
+	result, err := tb.Allow(context.Background(), "k")
+	require.NoError(t, err)
+	assert.Equal(t, time.Microsecond, result.RetryAfter)
+}
+
+func TestSlidingWindow_RetryAfterCanCrossBoundary(t *testing.T) {
+	start := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	store := &fixedDecisionStore{window: &limiter.WindowResult{
+		Allowed:     false,
+		Current:     10,
+		Previous:    0,
+		WindowStart: start,
+		Now:         start.Add(900 * time.Millisecond),
+	}}
+	sliding := algorithms.NewSlidingWindowCounter(store, limiter.Config{Limit: 10, Window: time.Second})
+
+	result, err := sliding.Allow(context.Background(), "k")
+	require.NoError(t, err)
+	assert.Equal(t, 200*time.Millisecond, result.RetryAfter,
+		"the full current window becomes previous at the boundary and needs 10%% of the next window to decay")
+	assert.Equal(t, start.Add(2*time.Second), result.ResetAt)
+}
+
+func TestSlidingWindow_RetryAfterWithinCurrentWindow(t *testing.T) {
+	start := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	store := &fixedDecisionStore{window: &limiter.WindowResult{
+		Allowed:     false,
+		Current:     5,
+		Previous:    10,
+		WindowStart: start,
+		Now:         start.Add(500 * time.Millisecond),
+	}}
+	sliding := algorithms.NewSlidingWindowCounter(store, limiter.Config{Limit: 10, Window: time.Second})
+
+	result, err := sliding.Allow(context.Background(), "k")
+	require.NoError(t, err)
+	assert.Equal(t, 100*time.Millisecond, result.RetryAfter)
+}
+
+func TestSlidingWindow_RetryAfterIsFirstSafeMicrosecond(t *testing.T) {
+	start := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	state := &limiter.WindowResult{
+		Allowed:     false,
+		Current:     7,
+		Previous:    9,
+		WindowStart: start,
+		Now:         start.Add(123456 * time.Microsecond),
+	}
+	store := &fixedDecisionStore{window: state}
+	sliding := algorithms.NewSlidingWindowCounter(store, limiter.Config{Limit: 10, Window: time.Second})
+
+	result, err := sliding.Allow(context.Background(), "k")
+	require.NoError(t, err)
+	require.Greater(t, result.RetryAfter, time.Duration(0))
+
+	targetOffset := state.Now.Sub(start) + result.RetryAfter
+	assert.True(t, weightedSlidingAllows(state, 1, 10, time.Second, targetOffset))
+	assert.False(t, weightedSlidingAllows(state, 1, 10, time.Second, targetOffset-time.Microsecond),
+		"one microsecond earlier must still be denied")
+}
+
+func weightedSlidingAllows(state *limiter.WindowResult, n, limit int, window, offset time.Duration) bool {
+	weighted := 0.0
+	switch {
+	case offset < window:
+		weighted = float64(state.Current) + float64(state.Previous)*(1-float64(offset)/float64(window))
+	case offset < 2*window:
+		weighted = float64(state.Current) * (1 - float64(offset-window)/float64(window))
+	}
+	return weighted+float64(n) <= float64(limit)
 }
 
 func TestTokenBucket_BurstDefaultsToLimit(t *testing.T) {
@@ -301,39 +441,55 @@ func TestAlgorithmsDoNotShareState(t *testing.T) {
 // TestConcurrentAdmissionIsExact is the atomicity contract: under
 // contention, exactly limit permits may be granted, never more.
 func TestConcurrentAdmissionIsExact(t *testing.T) {
-	s := newMemory(t)
 	ctx := context.Background()
 
-	limiters := map[string]limiter.RateLimiter{
+	constructors := map[string]func() limiter.RateLimiter{
 		// The hour-long window makes token refill negligible during the test.
-		"token_bucket":   algorithms.NewTokenBucket(s, limiter.Config{Limit: 100, Window: time.Hour, Burst: 100}),
-		"sliding_window": algorithms.NewSlidingWindowCounter(s, limiter.Config{Limit: 100, Window: time.Hour}),
-		"fixed_window":   algorithms.NewFixedWindowCounter(s, limiter.Config{Limit: 100, Window: time.Hour}),
+		"token_bucket": func() limiter.RateLimiter {
+			return algorithms.NewTokenBucket(newMemory(t), limiter.Config{Limit: 100, Window: time.Hour, Burst: 100})
+		},
+		"sliding_window": func() limiter.RateLimiter {
+			return algorithms.NewSlidingWindowCounter(newMemory(t), limiter.Config{Limit: 100, Window: time.Hour})
+		},
+		"fixed_window": func() limiter.RateLimiter {
+			return algorithms.NewFixedWindowCounter(newMemory(t), limiter.Config{Limit: 100, Window: time.Hour})
+		},
 	}
 
-	for name, lim := range limiters {
+	for name, construct := range constructors {
 		t.Run(name, func(t *testing.T) {
+			instance := construct()
+			type outcome struct {
+				allowed bool
+				err     error
+			}
 			var wg sync.WaitGroup
-			results := make(chan bool, 300)
+			results := make(chan outcome, 300)
 			for i := 0; i < 300; i++ {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					res, err := lim.Allow(ctx, "hot-key-"+name)
-					if err == nil {
-						results <- res.Allowed
+					result, err := instance.Allow(ctx, "hot-key")
+					if err != nil {
+						results <- outcome{err: err}
+						return
 					}
+					results <- outcome{allowed: result.Allowed}
 				}()
 			}
 			wg.Wait()
 			close(results)
 
 			allowed := 0
-			for a := range results {
-				if a {
+			seen := 0
+			for result := range results {
+				require.NoError(t, result.err)
+				seen++
+				if result.allowed {
 					allowed++
 				}
 			}
+			assert.Equal(t, 300, seen)
 			assert.Equal(t, 100, allowed)
 		})
 	}
@@ -352,8 +508,42 @@ func TestMultipleKeysAreIndependent(t *testing.T) {
 		assert.True(t, res2.Allowed)
 	}
 
-	res1, _ := tb.Allow(ctx, "key1")
-	res2, _ := tb.Allow(ctx, "key2")
+	res1, err := tb.Allow(ctx, "key1")
+	require.NoError(t, err)
+	res2, err := tb.Allow(ctx, "key2")
+	require.NoError(t, err)
 	assert.False(t, res1.Allowed)
 	assert.False(t, res2.Allowed)
+}
+
+func TestEveryAlgorithm_PeekAndResetPreserveContract(t *testing.T) {
+	ctx := context.Background()
+	cfg := limiter.Config{Limit: 5, Window: time.Hour, Burst: 5}
+	constructors := map[string]func(limiter.Store) limiter.RateLimiter{
+		"token_bucket":   func(s limiter.Store) limiter.RateLimiter { return algorithms.NewTokenBucket(s, cfg) },
+		"sliding_window": func(s limiter.Store) limiter.RateLimiter { return algorithms.NewSlidingWindowCounter(s, cfg) },
+		"fixed_window":   func(s limiter.Store) limiter.RateLimiter { return algorithms.NewFixedWindowCounter(s, cfg) },
+	}
+
+	for name, construct := range constructors {
+		t.Run(name, func(t *testing.T) {
+			instance := construct(newMemory(t))
+			consumed, err := instance.AllowN(ctx, "k", 5)
+			require.NoError(t, err)
+			require.True(t, consumed.Allowed)
+
+			for i := 0; i < 3; i++ {
+				state, err := instance.Peek(ctx, "k")
+				require.NoError(t, err)
+				assert.False(t, state.Allowed)
+				assert.Equal(t, 0, state.Remaining)
+			}
+
+			require.NoError(t, instance.Reset(ctx, "k"))
+			state, err := instance.Peek(ctx, "k")
+			require.NoError(t, err)
+			assert.True(t, state.Allowed)
+			assert.Equal(t, 5, state.Remaining)
+		})
+	}
 }

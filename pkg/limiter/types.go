@@ -14,16 +14,21 @@ import (
 // rather than a rate-limit denial.
 var ErrExceedsLimit = errors.New("requested count exceeds the configured limit")
 
-// ErrInvalidCount is returned when a caller passes a negative permit count.
-var ErrInvalidCount = errors.New("count must not be negative")
+// ErrInvalidCount is returned when a caller requests zero or fewer permits.
+// Read-only inspection is provided explicitly by RateLimiter.Peek.
+var ErrInvalidCount = errors.New("count must be positive")
+
+// ErrInvalidStoreOperation is returned when a low-level store operation is
+// called with values outside the shared memory/Redis contract.
+var ErrInvalidStoreOperation = errors.New("invalid store operation")
 
 // Result describes the outcome of a rate-limit decision.
 type Result struct {
 	Allowed    bool          // whether the request may proceed
-	Limit      int           // configured maximum for the window / bucket capacity
-	Remaining  int           // permits left after this decision
-	ResetAt    time.Time     // when the window rolls over or the bucket refills completely
-	RetryAfter time.Duration // how long to wait before retrying; 0 when allowed
+	Limit      int           // current permit capacity (window limit or bucket capacity)
+	Remaining  int           // permits available immediately after this decision
+	ResetAt    time.Time     // when full capacity returns if no further permits are consumed
+	RetryAfter time.Duration // earliest safe retry interval; 0 when allowed
 }
 
 // RateLimiter is implemented by every rate-limiting algorithm.
@@ -33,8 +38,8 @@ type RateLimiter interface {
 	Allow(ctx context.Context, key string) (*Result, error)
 
 	// AllowN reports whether n requests for key may proceed, consuming n
-	// permits if so. The decision is all-or-nothing: either every permit
-	// is granted or none are.
+	// permits if so. n must be positive. The decision is all-or-nothing:
+	// either every permit is granted or none are.
 	AllowN(ctx context.Context, key string, n int) (*Result, error)
 
 	// Peek returns the current state for key without consuming permits.
@@ -46,7 +51,7 @@ type RateLimiter interface {
 
 // Config carries the parameters every algorithm is constructed from.
 type Config struct {
-	Limit  int           // maximum requests per window (and the refill amount for token buckets)
+	Limit  int           // maximum requests per window (and refill amount for token buckets)
 	Window time.Duration // length of the window / refill period
 	Burst  int           // token-bucket capacity; defaults to Limit when zero
 }
@@ -58,6 +63,13 @@ type WindowResult struct {
 	Previous    int64     // previous-window count
 	WindowStart time.Time // start of the current window, per the store's clock
 	Now         time.Time // the store's clock at decision time
+}
+
+// TokenResult is the outcome of an atomic token-bucket operation.
+type TokenResult struct {
+	Allowed bool      // whether the requested tokens were consumed
+	Tokens  float64   // token balance after the operation
+	Now     time.Time // the store's clock at decision time
 }
 
 // Store abstracts the state backend. Implementations must make each method
@@ -76,12 +88,11 @@ type Store interface {
 
 	// TakeTokens atomically refills the token bucket for key (up to
 	// capacity, at refillPerSec tokens per second since the last refill)
-	// and consumes n tokens if at least n are available. It returns the
-	// token count after the operation. n=0 performs a read-only peek.
-	// ttl bounds how long idle state is retained; it must be at least the
-	// time a bucket takes to refill completely, so that expiry of an idle
-	// key is indistinguishable from a full refill.
-	TakeTokens(ctx context.Context, key string, capacity, refillPerSec, n float64, ttl time.Duration) (allowed bool, tokens float64, err error)
+	// and consumes n tokens if at least n are available. n=0 performs a
+	// read-only peek. ttl must be at least the time a bucket takes to refill
+	// completely, so expiry of an idle key is indistinguishable from a full
+	// refill.
+	TakeTokens(ctx context.Context, key string, capacity, refillPerSec, n float64, ttl time.Duration) (*TokenResult, error)
 
 	// Delete removes all state for key.
 	Delete(ctx context.Context, key string) error

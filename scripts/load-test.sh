@@ -1,101 +1,74 @@
-#!/bin/bash
+#!/bin/sh
 
-# Load testing script using Vegeta
-# Usage: ./load-test.sh [duration] [rate]
+# Load testing script using Vegeta.
+# Usage: ./scripts/load-test.sh [duration] [rate]
+# Set LOAD_TEST_POLICY_OVERRIDES=true only when the service was intentionally
+# started with ALLOW_POLICY_OVERRIDES=true.
 
-set -e
+set -eu
 
-# Defaults target a locally run server (go run ./cmd/server). For the Docker
-# Compose stack use: TARGET_URL=http://localhost:8081 ./scripts/load-test.sh
 DURATION=${1:-30s}
 RATE=${2:-1000}
-TARGET_URL=${TARGET_URL:-http://localhost:8080}
-OUTPUT_DIR="./load-test-results"
+TARGET_URL=${TARGET_URL:-http://127.0.0.1:8080}
+OUTPUT_DIR=${OUTPUT_DIR:-./load-test-results}
+LOAD_TEST_POLICY_OVERRIDES=${LOAD_TEST_POLICY_OVERRIDES:-false}
+RUN_ID=${RUN_ID:-$(date +%s)-$$}
 
-echo "==================================="
-echo "Rate Limiter Load Test"
-echo "==================================="
-echo "Target URL: $TARGET_URL"
-echo "Duration: $DURATION"
-echo "Rate: $RATE req/sec"
-echo "==================================="
+printf '%s\n' \
+    '===================================' \
+    'Rate Limiter Load Test' \
+    '===================================' \
+    "Target URL: $TARGET_URL" \
+    "Duration: $DURATION" \
+    "Rate: $RATE req/sec" \
+    "Policy overrides: $LOAD_TEST_POLICY_OVERRIDES" \
+    '==================================='
 
-# Create output directory
-mkdir -p $OUTPUT_DIR
+mkdir -p "$OUTPUT_DIR"
 
-# Check if vegeta is installed
-if ! command -v vegeta &> /dev/null; then
-    echo "Error: vegeta is not installed"
-    echo "Install with: go install github.com/tsenart/vegeta@latest"
+if ! command -v vegeta >/dev/null 2>&1; then
+    echo "Error: vegeta is not installed" >&2
+    echo "Install with: go install github.com/tsenart/vegeta@latest" >&2
     exit 1
 fi
 
-# Generate test targets
-cat > $OUTPUT_DIR/targets.txt << EOF
-POST $TARGET_URL/v1/check
-Content-Type: application/json
+write_target() {
+    resource=$1
+    identifier=$2
+    algorithm=$3
 
-{
-  "resource": "api.users.create",
-  "identifier": "user-123",
-  "algorithm": "token_bucket"
+    printf 'POST %s/v1/check\nContent-Type: application/json\n\n' "$TARGET_URL"
+    if [ "$LOAD_TEST_POLICY_OVERRIDES" = "true" ]; then
+        printf '{"resource":"%s","identifier":"%s","algorithm":"%s"}\n\n' \
+            "$resource" "$identifier" "$algorithm"
+    else
+        printf '{"resource":"%s","identifier":"%s"}\n\n' \
+            "$resource" "$identifier"
+    fi
 }
 
-POST $TARGET_URL/v1/check
-Content-Type: application/json
-
 {
-  "resource": "api.posts.create",
-  "identifier": "user-456",
-  "algorithm": "sliding_window"
-}
-
-POST $TARGET_URL/v1/check
-Content-Type: application/json
-
-{
-  "resource": "api.comments.create",
-  "identifier": "user-789",
-  "algorithm": "fixed_window"
-}
-EOF
+    write_target api.users.create "user-$RUN_ID-1" token_bucket
+    write_target api.posts.create "user-$RUN_ID-2" sliding_window
+    write_target api.comments.create "user-$RUN_ID-3" fixed_window
+} > "$OUTPUT_DIR/targets.txt"
 
 echo "Running load test..."
-
-# Run vegeta attack
 vegeta attack \
-  -targets=$OUTPUT_DIR/targets.txt \
-  -duration=$DURATION \
-  -rate=$RATE \
-  -workers=10 \
-  > $OUTPUT_DIR/results.bin
+    -targets="$OUTPUT_DIR/targets.txt" \
+    -duration="$DURATION" \
+    -rate="$RATE" \
+    -workers=10 \
+    > "$OUTPUT_DIR/results.bin"
 
 echo "Load test complete. Generating reports..."
+vegeta report "$OUTPUT_DIR/results.bin" > "$OUTPUT_DIR/report.txt"
+vegeta plot "$OUTPUT_DIR/results.bin" > "$OUTPUT_DIR/plot.html"
+vegeta report -type='hist[0,1ms,5ms,10ms,50ms,100ms,500ms,1s,5s]' \
+    "$OUTPUT_DIR/results.bin" > "$OUTPUT_DIR/histogram.txt"
 
-# Generate text report
-vegeta report $OUTPUT_DIR/results.bin > $OUTPUT_DIR/report.txt
-
-# Generate HTML plot
-vegeta plot $OUTPUT_DIR/results.bin > $OUTPUT_DIR/plot.html
-
-# Generate latency histogram
-vegeta report -type='hist[0,1ms,5ms,10ms,50ms,100ms,500ms,1s,5s]' $OUTPUT_DIR/results.bin > $OUTPUT_DIR/histogram.txt
-
-# Display results
-echo ""
-echo "==================================="
-echo "Load Test Results"
-echo "==================================="
-cat $OUTPUT_DIR/report.txt
-
-echo ""
-echo "==================================="
-echo "Latency Histogram"
-echo "==================================="
-cat $OUTPUT_DIR/histogram.txt
-
-echo ""
-echo "==================================="
-echo "Results saved to: $OUTPUT_DIR"
-echo "View HTML plot: open $OUTPUT_DIR/plot.html"
-echo "==================================="
+printf '\n%s\n' '===================================' 'Load Test Results' '==================================='
+cat "$OUTPUT_DIR/report.txt"
+printf '\n%s\n' '===================================' 'Latency Histogram' '==================================='
+cat "$OUTPUT_DIR/histogram.txt"
+printf '\nResults saved to: %s\n' "$OUTPUT_DIR"

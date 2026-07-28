@@ -18,6 +18,7 @@ type MemoryStore struct {
 	mu      sync.RWMutex
 	windows map[string]*windowEntry
 	buckets map[string]*bucketEntry
+	now     func() time.Time
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -29,24 +30,33 @@ type windowEntry struct {
 	mu        sync.Mutex
 	deleted   bool  // set by the janitor; holders must re-fetch from the map
 	curStart  int64 // unix microseconds
+	lastNow   int64 // monotonic per-key decision clock, unix microseconds
 	cur, prev int64
 	expiresAt int64 // unix microseconds
 }
 
 type bucketEntry struct {
-	mu        sync.Mutex
-	deleted   bool
-	tokens    float64
-	ts        float64 // unix seconds of the last refill, fractional
-	expiresAt int64   // unix microseconds
+	mu          sync.Mutex
+	deleted     bool
+	initialized bool
+	tokens      float64
+	tsUS        int64 // monotonic per-key refill clock, unix microseconds
+	expiresAt   int64 // unix microseconds
 }
 
 // NewMemoryStore creates an in-memory store and starts its eviction loop.
 // Call Close to stop the loop.
 func NewMemoryStore() *MemoryStore {
+	return newMemoryStore(time.Now)
+}
+
+// newMemoryStore accepts a clock so boundary behaviour can be tested without
+// sleeps. Production callers use NewMemoryStore.
+func newMemoryStore(now func() time.Time) *MemoryStore {
 	ms := &MemoryStore{
 		windows: make(map[string]*windowEntry),
 		buckets: make(map[string]*bucketEntry),
+		now:     now,
 		stop:    make(chan struct{}),
 	}
 	go ms.janitor()
@@ -54,48 +64,84 @@ func NewMemoryStore() *MemoryStore {
 }
 
 // IncrWindow implements limiter.Store.
-func (ms *MemoryStore) IncrWindow(_ context.Context, key string, window time.Duration, n, limit int64, weightPrev bool, ttl time.Duration) (*limiter.WindowResult, error) {
+func (ms *MemoryStore) IncrWindow(ctx context.Context, key string, window time.Duration, n, limit int64, weightPrev bool, ttl time.Duration) (*limiter.WindowResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateWindowOperation(window, n, limit, weightPrev, ttl); err != nil {
+		return nil, err
+	}
+	// A peek or an intrinsically impossible request never needs to create or
+	// mutate state. This mirrors Redis, where the scripts write only after a
+	// positive admission.
+	readOnly := n == 0 || n > limit
+	var e *windowEntry
+	if readOnly {
+		var ok bool
+		e, ok = ms.lookupWindowEntry(key)
+		if !ok {
+			return ms.emptyWindowResult(window, n, limit), nil
+		}
+	} else {
+		e = ms.windowEntry(key)
+	}
+
 	for {
-		e := ms.windowEntry(key)
 		e.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			e.mu.Unlock()
+			return nil, err
+		}
 		if e.deleted {
 			e.mu.Unlock()
+			if readOnly {
+				var ok bool
+				e, ok = ms.lookupWindowEntry(key)
+				if !ok {
+					return ms.emptyWindowResult(window, n, limit), nil
+				}
+			} else {
+				e = ms.windowEntry(key)
+			}
 			continue // evicted between lookup and lock; fetch a fresh entry
 		}
 
-		now := time.Now()
-		nowUS := now.UnixMicro()
+		nowUS := ms.now().UnixMicro()
+		if nowUS < e.lastNow {
+			nowUS = e.lastNow
+		}
 		w := window.Microseconds()
 		start := nowUS - nowUS%w
+		curStart, cur, prev := e.curStart, e.cur, e.prev
 
 		switch {
-		case e.curStart == start:
+		case curStart == start:
 			// still in the same window
-		case e.curStart == start-w:
-			e.prev, e.cur, e.curStart = e.cur, 0, start
+		case curStart == start-w:
+			prev, cur, curStart = cur, 0, start
 		default:
-			e.prev, e.cur, e.curStart = 0, 0, start
+			prev, cur, curStart = 0, 0, start
 		}
 
-		weighted := float64(e.cur)
-		if weightPrev && e.prev > 0 {
-			weighted += float64(e.prev) * (1 - float64(nowUS-start)/float64(w))
+		weighted := float64(cur)
+		if weightPrev && prev > 0 {
+			weighted += float64(prev) * (1 - float64(nowUS-start)/float64(w))
 		}
 
 		allowed := weighted+float64(n) <= float64(limit)
 		if allowed && n > 0 {
-			e.cur += n
+			cur += n
+			e.curStart, e.cur, e.prev = curStart, cur, prev
+			e.lastNow = nowUS
+			e.expiresAt = nowUS + durationMicrosCeil(ttl)
 		}
-		// Every touch counts as activity, including peeks and denials;
-		// otherwise an entry created by a peek would never expire.
-		e.expiresAt = nowUS + ttl.Microseconds()
 
 		res := &limiter.WindowResult{
 			Allowed:     allowed,
-			Current:     e.cur,
-			Previous:    e.prev,
+			Current:     cur,
+			Previous:    prev,
 			WindowStart: time.UnixMicro(start),
-			Now:         now,
+			Now:         time.UnixMicro(nowUS),
 		}
 		e.mu.Unlock()
 		return res, nil
@@ -103,44 +149,87 @@ func (ms *MemoryStore) IncrWindow(_ context.Context, key string, window time.Dur
 }
 
 // TakeTokens implements limiter.Store.
-func (ms *MemoryStore) TakeTokens(_ context.Context, key string, capacity, refillPerSec, n float64, ttl time.Duration) (bool, float64, error) {
+func (ms *MemoryStore) TakeTokens(ctx context.Context, key string, capacity, refillPerSec, n float64, ttl time.Duration) (*limiter.TokenResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateTokenOperation(capacity, refillPerSec, n, ttl); err != nil {
+		return nil, err
+	}
+	readOnly := n == 0 || n > capacity
+	var e *bucketEntry
+	if readOnly {
+		var ok bool
+		e, ok = ms.lookupBucketEntry(key)
+		if !ok {
+			return ms.emptyTokenResult(capacity, n), nil
+		}
+	} else {
+		e = ms.bucketEntry(key)
+	}
+
 	for {
-		e := ms.bucketEntry(key, capacity)
 		e.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			e.mu.Unlock()
+			return nil, err
+		}
 		if e.deleted {
 			e.mu.Unlock()
+			if readOnly {
+				var ok bool
+				e, ok = ms.lookupBucketEntry(key)
+				if !ok {
+					return ms.emptyTokenResult(capacity, n), nil
+				}
+			} else {
+				e = ms.bucketEntry(key)
+			}
 			continue
 		}
 
-		now := time.Now()
-		nowSec := float64(now.UnixMicro()) / 1e6
+		nowUS := ms.now().UnixMicro()
+		tokens, tsUS := capacity, nowUS
+		if e.initialized {
+			tokens, tsUS = e.tokens, e.tsUS
+		}
+		if nowUS < tsUS {
+			nowUS = tsUS
+		}
 
-		// Commit the refill unconditionally: tokens and ts must advance
-		// together or the same elapsed time would be credited twice.
-		if elapsed := nowSec - e.ts; elapsed > 0 {
-			e.tokens += elapsed * refillPerSec
-			if e.tokens > capacity {
-				e.tokens = capacity
+		if elapsedUS := nowUS - tsUS; elapsedUS > 0 {
+			tokens += float64(elapsedUS) / 1e6 * refillPerSec
+			if tokens > capacity {
+				tokens = capacity
 			}
 		}
-		e.ts = nowSec
 
-		allowed := n <= e.tokens
+		allowed := n <= tokens
 		if allowed && n > 0 {
-			e.tokens -= n
+			tokens -= n
+			e.initialized = true
+			e.tokens = tokens
+			e.tsUS = nowUS
+			e.expiresAt = nowUS + durationMicrosCeil(ttl)
 		}
-		e.expiresAt = now.UnixMicro() + ttl.Microseconds()
 
-		tokens := e.tokens
+		result := &limiter.TokenResult{Allowed: allowed, Tokens: tokens, Now: time.UnixMicro(nowUS)}
 		e.mu.Unlock()
-		return allowed, tokens, nil
+		return result, nil
 	}
 }
 
 // Delete implements limiter.Store.
-func (ms *MemoryStore) Delete(_ context.Context, key string) error {
+func (ms *MemoryStore) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if e, ok := ms.windows[key]; ok {
 		e.mu.Lock()
 		e.deleted = true
@@ -156,8 +245,18 @@ func (ms *MemoryStore) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+// durationMicrosCeil converts a positive duration to the store clock's
+// microsecond resolution without expiring state earlier than requested.
+func durationMicrosCeil(d time.Duration) int64 {
+	micros := d / time.Microsecond
+	if d%time.Microsecond != 0 {
+		micros++
+	}
+	return int64(micros)
+}
+
 // Ping implements limiter.Store.
-func (ms *MemoryStore) Ping(context.Context) error { return nil }
+func (ms *MemoryStore) Ping(ctx context.Context) error { return ctx.Err() }
 
 // Close stops the eviction loop.
 func (ms *MemoryStore) Close() error {
@@ -183,7 +282,25 @@ func (ms *MemoryStore) windowEntry(key string) *windowEntry {
 	return e
 }
 
-func (ms *MemoryStore) bucketEntry(key string, capacity float64) *bucketEntry {
+func (ms *MemoryStore) lookupWindowEntry(key string) (*windowEntry, bool) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	e, ok := ms.windows[key]
+	return e, ok
+}
+
+func (ms *MemoryStore) emptyWindowResult(window time.Duration, n, limit int64) *limiter.WindowResult {
+	nowUS := ms.now().UnixMicro()
+	w := window.Microseconds()
+	start := nowUS - nowUS%w
+	return &limiter.WindowResult{
+		Allowed:     n <= limit,
+		WindowStart: time.UnixMicro(start),
+		Now:         time.UnixMicro(nowUS),
+	}
+}
+
+func (ms *MemoryStore) bucketEntry(key string) *bucketEntry {
 	ms.mu.RLock()
 	e, ok := ms.buckets[key]
 	ms.mu.RUnlock()
@@ -196,10 +313,25 @@ func (ms *MemoryStore) bucketEntry(key string, capacity float64) *bucketEntry {
 	if e, ok := ms.buckets[key]; ok {
 		return e
 	}
-	// A key that has never been seen starts with a full bucket, refilled now.
-	e = &bucketEntry{tokens: capacity, ts: float64(time.Now().UnixMicro()) / 1e6}
+	e = &bucketEntry{}
 	ms.buckets[key] = e
 	return e
+}
+
+func (ms *MemoryStore) lookupBucketEntry(key string) (*bucketEntry, bool) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	e, ok := ms.buckets[key]
+	return e, ok
+}
+
+func (ms *MemoryStore) emptyTokenResult(capacity, n float64) *limiter.TokenResult {
+	nowUS := ms.now().UnixMicro()
+	return &limiter.TokenResult{
+		Allowed: n <= capacity,
+		Tokens:  capacity,
+		Now:     time.UnixMicro(nowUS),
+	}
 }
 
 // janitor evicts entries whose TTL has passed. Expiry is equivalent to a
@@ -214,7 +346,7 @@ func (ms *MemoryStore) janitor() {
 		case <-ms.stop:
 			return
 		case <-ticker.C:
-			ms.sweep(time.Now().UnixMicro())
+			ms.sweep(ms.now().UnixMicro())
 		}
 	}
 }
@@ -225,7 +357,7 @@ func (ms *MemoryStore) sweep(cutoff int64) {
 	defer ms.mu.Unlock()
 	for key, e := range ms.windows {
 		e.mu.Lock()
-		if e.expiresAt != 0 && e.expiresAt < cutoff {
+		if e.expiresAt != 0 && e.expiresAt <= cutoff {
 			e.deleted = true
 			delete(ms.windows, key)
 		}
@@ -233,7 +365,7 @@ func (ms *MemoryStore) sweep(cutoff int64) {
 	}
 	for key, e := range ms.buckets {
 		e.mu.Lock()
-		if e.expiresAt != 0 && e.expiresAt < cutoff {
+		if e.expiresAt != 0 && e.expiresAt <= cutoff {
 			e.deleted = true
 			delete(ms.buckets, key)
 		}

@@ -1,16 +1,17 @@
-# Build stage
-FROM golang:1.24-alpine AS builder
+# Build stage. The patch release is pinned for reproducible container builds;
+# go.mod declares the minimum language/toolchain requirement.
+FROM golang:1.26.5-alpine3.24 AS builder
 
 WORKDIR /src
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download && go mod verify
 
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/rate-limiter ./cmd/server
 
 # Runtime stage
-FROM alpine:3.21
+FROM alpine:3.24
 
 RUN apk --no-cache add ca-certificates \
     && addgroup -S app \

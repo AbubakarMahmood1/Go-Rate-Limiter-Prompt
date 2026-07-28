@@ -15,7 +15,7 @@ import (
 //	weighted = current + previous * (1 - elapsed/window)
 //
 // It smooths the boundary bursts fixed windows allow while storing only two
-// counters per key, and is a good default for most workloads.
+// counters per key.
 type SlidingWindowCounter struct {
 	store  limiter.Store
 	limit  int
@@ -30,7 +30,7 @@ func NewSlidingWindowCounter(store limiter.Store, config limiter.Config) *Slidin
 		store:  store,
 		limit:  config.Limit,
 		window: config.Window,
-		ttl:    2*config.Window + time.Second,
+		ttl:    windowRetention(config.Window),
 	}
 }
 
@@ -41,7 +41,7 @@ func (s *SlidingWindowCounter) Allow(ctx context.Context, key string) (*limiter.
 
 // AllowN implements limiter.RateLimiter.
 func (s *SlidingWindowCounter) AllowN(ctx context.Context, key string, n int) (*limiter.Result, error) {
-	if n < 0 {
+	if n <= 0 {
 		return nil, limiter.ErrInvalidCount
 	}
 	if n > s.limit {
@@ -80,11 +80,15 @@ func (s *SlidingWindowCounter) result(w *limiter.WindowResult, n int) *limiter.R
 	if weight < 0 {
 		weight = 0
 	}
+	if weight > 1 {
+		weight = 1
+	}
 	weighted := float64(w.Current) + float64(w.Previous)*weight
 
-	// Ceil is the conservative choice: never promise a permit the weighted
-	// count would deny. The epsilon keeps exact integers from rounding up.
-	remaining := s.limit - int(math.Ceil(weighted-1e-9))
+	// Floor the exact remaining budget used by the store's admission formula.
+	// Floating-point error may under-report by one permit, but it must never
+	// advertise a permit that the next atomic decision would deny.
+	remaining := int(math.Floor(float64(s.limit) - weighted))
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -93,7 +97,7 @@ func (s *SlidingWindowCounter) result(w *limiter.WindowResult, n int) *limiter.R
 		Allowed:   w.Allowed,
 		Limit:     s.limit,
 		Remaining: remaining,
-		ResetAt:   w.WindowStart.Add(s.window),
+		ResetAt:   s.fullResetAt(w),
 	}
 	if !w.Allowed {
 		r.RetryAfter = s.retryAfter(w, n)
@@ -101,24 +105,65 @@ func (s *SlidingWindowCounter) result(w *limiter.WindowResult, n int) *limiter.R
 	return r
 }
 
-// retryAfter solves the weighted-count formula for the earliest time the
-// denied request could succeed. With x the elapsed fraction of the current
-// window, admission requires
-//
-//	current + previous*(1-x) + n <= limit
-//
-// which holds once x >= (current + previous + n - limit) / previous.
+// retryAfter returns the earliest microsecond at which the same request would
+// succeed if no other requests arrive. A lower-bound search mirrors the exact
+// floating-point expression used by both stores, avoiding an optimistic
+// answer at a rounding boundary. There are two phases: the previous counter
+// decays until the current boundary, then the current counter becomes the
+// previous counter and decays through the next window.
 func (s *SlidingWindowCounter) retryAfter(w *limiter.WindowResult, n int) time.Duration {
-	if w.Previous > 0 {
-		frac := float64(w.Current+w.Previous+int64(n)-int64(s.limit)) / float64(w.Previous)
-		if frac <= 1 {
-			target := w.WindowStart.Add(time.Duration(frac * float64(s.window)))
-			if d := target.Sub(w.Now); d > 0 {
-				return d
-			}
+	windowUS := s.window.Microseconds()
+	if windowUS <= 0 || windowUS > int64(maxDuration/time.Microsecond)/2 {
+		return maxDuration
+	}
+
+	elapsedUS := w.Now.Sub(w.WindowStart).Microseconds()
+	if elapsedUS < 0 {
+		elapsedUS = 0
+	}
+	if elapsedUS > windowUS {
+		elapsedUS = windowUS
+	}
+	if s.slidingAllowsAt(w, n, elapsedUS, windowUS) {
+		return 0
+	}
+
+	low, high := elapsedUS+1, 2*windowUS
+	for low < high {
+		mid := low + (high-low)/2
+		if s.slidingAllowsAt(w, n, mid, windowUS) {
+			high = mid
+		} else {
+			low = mid + 1
 		}
 	}
-	// The previous window sliding off is not enough; the current window
-	// itself must roll over before the count can drop.
-	return w.WindowStart.Add(s.window).Sub(w.Now)
+	return time.Duration(low-elapsedUS) * time.Microsecond
+}
+
+func (s *SlidingWindowCounter) slidingAllowsAt(w *limiter.WindowResult, n int, offsetUS, windowUS int64) bool {
+	weighted := 0.0
+	switch {
+	case offsetUS < windowUS:
+		weighted = float64(w.Current)
+		if w.Previous > 0 {
+			weighted += float64(w.Previous) * (1 - float64(offsetUS)/float64(windowUS))
+		}
+	case offsetUS < 2*windowUS:
+		weighted = float64(w.Current) * (1 - float64(offsetUS-windowUS)/float64(windowUS))
+	}
+	return weighted+float64(n) <= float64(s.limit)
+}
+
+func (s *SlidingWindowCounter) fullResetAt(w *limiter.WindowResult) time.Time {
+	windowEnd := w.WindowStart.Add(s.window)
+	switch {
+	case w.Current > 0:
+		// Current becomes previous at windowEnd and reaches zero one window
+		// later if no more permits are consumed.
+		return windowEnd.Add(s.window)
+	case w.Previous > 0:
+		return windowEnd
+	default:
+		return w.Now
+	}
 }

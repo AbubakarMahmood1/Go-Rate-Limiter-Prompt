@@ -5,64 +5,108 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       redis:
-        image: redis:7.4-alpine
+        image: redis:7.4.9-alpine3.21
         ports:
           - 6379:6379
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 3s
-          --health-retries 5
+          --health-retries 10
     env:
-      REDIS_ADDR: localhost:6379
+      REDIS_ADDR: 127.0.0.1:6379
+      REQUIRE_REDIS: "1"
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: 1.26.5
+          cache: true
+
+      - name: Tool versions
+        run: |
+          go version
+          redis-cli --version
+
+      - name: Download and verify modules
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Scan reachable dependencies
+        run: make vuln
 
       - name: Check formatting
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "gofmt required for:" && echo "$unformatted" && exit 1
-          fi
+        run: make fmt-check
 
       - name: Vet
-        run: go vet ./...
+        run: make vet
 
       - name: Build
-        run: go build ./...
+        run: make build
 
-      - name: Test (unit + Redis integration, race detector)
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: Test all packages with race detector and required Redis integration
+        run: go test -race -count=1 -coverprofile=coverage.out -v ./...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
-  docker:
+  image:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Build image
         run: docker build -f docker/Dockerfile -t rate-limiter:ci .
 
       - name: Smoke test image
+        env:
+          RESET_TOKEN: ci-reset-token-0123456789abcdef
         run: |
-          docker run -d --rm --name rl -p 8080:8080 rate-limiter:ci
-          for i in $(seq 1 20); do
-            if curl -fsS http://localhost:8080/health > /dev/null 2>&1; then break; fi
+          set -euo pipefail
+          docker run -d --rm --name rl -p 8080:8080 \
+            -e RESET_TOKEN="$RESET_TOKEN" \
+            rate-limiter:ci
+          trap 'docker logs rl || true; docker rm -f rl >/dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+              break
+            fi
             sleep 1
           done
-          curl -fsS http://localhost:8080/health
-          curl -fsS -X POST http://localhost:8080/v1/check \
-            -H 'Content-Type: application/json' \
-            -d '{"resource":"api.ci.smoke","identifier":"ci"}'
-          docker stop rl
+          curl -fsS http://127.0.0.1:8080/health >/dev/null
+          TARGET_URL=http://127.0.0.1:8080 ./scripts/smoke-test.sh
+
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate Compose configuration
+        run: docker compose -f docker/docker-compose.yml config --quiet
+
+      - name: Exercise the complete stack and Redis fail-closed recovery
+        run: ./scripts/compose-smoke-test.sh
