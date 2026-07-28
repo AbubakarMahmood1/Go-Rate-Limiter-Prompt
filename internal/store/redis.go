@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/AbubakarMahmood/go-rate-limiter/pkg/limiter"
@@ -11,40 +12,47 @@ import (
 )
 
 // RedisStore is a Redis-backed limiter.Store for distributed deployments.
-// Every decision executes as a single Lua script, so concurrent checks from
-// any number of application instances serialize on the Redis server and can
-// never over-admit. Scripts read the Redis server clock (TIME), which keeps
-// instances with skewed local clocks consistent with each other.
+// Every decision executes as one Lua script, so concurrent checks from any
+// number of service instances serialize on Redis and cannot over-admit.
+// Scripts use Redis TIME, keeping decisions independent of application-clock
+// skew.
+//
+// The verified contract is one standalone Redis endpoint. Cluster, Sentinel,
+// failover, and multi-region behavior are intentionally not advertised.
 type RedisStore struct {
-	client redis.UniversalClient
+	client *redis.Client
 }
 
 // RedisConfig holds Redis connection configuration.
 type RedisConfig struct {
-	Addresses []string // one address for a single instance, several for cluster mode
+	Addresses []string // exactly one standalone Redis address is supported
 	Password  string
-	DB        int // ignored in cluster mode
-	PoolSize  int
+	DB        int
+	PoolSize  int // 0 uses go-redis's default
 }
 
-// NewRedisStore connects to Redis (or a Redis Cluster when more than one
-// address is given) and verifies the connection.
+// NewRedisStore connects to one standalone Redis endpoint and verifies it.
 func NewRedisStore(config RedisConfig) (*RedisStore, error) {
-	var client redis.UniversalClient
-	if len(config.Addresses) == 1 {
-		client = redis.NewClient(&redis.Options{
-			Addr:     config.Addresses[0],
-			Password: config.Password,
-			DB:       config.DB,
-			PoolSize: config.PoolSize,
-		})
-	} else {
-		client = redis.NewClusterClient(&redis.ClusterOptions{
-			Addrs:    config.Addresses,
-			Password: config.Password,
-			PoolSize: config.PoolSize,
-		})
+	if len(config.Addresses) != 1 {
+		return nil, fmt.Errorf("redis requires exactly one standalone address")
 	}
+	address := strings.TrimSpace(config.Addresses[0])
+	if address == "" || strings.Contains(address, ",") {
+		return nil, fmt.Errorf("redis requires exactly one non-empty standalone address")
+	}
+	if config.DB < 0 {
+		return nil, fmt.Errorf("redis db must not be negative")
+	}
+	if config.PoolSize < 0 {
+		return nil, fmt.Errorf("redis pool size must not be negative")
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     address,
+		Password: config.Password,
+		DB:       config.DB,
+		PoolSize: config.PoolSize,
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -56,16 +64,17 @@ func NewRedisStore(config RedisConfig) (*RedisStore, error) {
 	return &RedisStore{client: client}, nil
 }
 
-// incrWindowScript implements fixed- and sliding-window admission in one
-// atomic step. State is a hash keyed by window start (unix microseconds);
-// only the current and previous windows are ever read, and stale fields are
-// pruned on write, so each key holds at most a handful of fields.
+// incrWindowScript implements fixed- and weighted sliding-window admission in
+// one atomic step. Numeric fields are keyed by window start (unix
+// microseconds); __last_now records the latest decision clock committed by a
+// permit-consuming write, preventing a host-clock rollback from moving a key
+// into an older window. Peeks and denials do not modify permit state.
 //
 // KEYS[1] counter key
 // ARGV[1] window length, microseconds
 // ARGV[2] permits requested (0 = read-only peek)
 // ARGV[3] limit
-// ARGV[4] 1 = weigh the previous window (sliding), 0 = ignore it (fixed)
+// ARGV[4] 1 = weigh previous window, 0 = fixed-window semantics
 // ARGV[5] TTL, seconds
 //
 // Returns {allowed, current, previous, windowStartMicros, nowMicros}.
@@ -78,11 +87,16 @@ local ttl = tonumber(ARGV[5])
 
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
+local last_now = tonumber(redis.call('HGET', KEYS[1], '__last_now'))
+if last_now ~= nil and now < last_now then
+	now = last_now
+end
+
 local cur_start = now - (now % window)
 local prev_start = cur_start - window
 
--- Field names must be formatted explicitly: Lua's tostring renders large
--- numbers in scientific notation, which loses precision.
+-- tostring may use scientific notation for large values; explicit formatting
+-- preserves exact microsecond field names below 2^53.
 local cur_field = string.format('%.0f', cur_start)
 local prev_field = string.format('%.0f', prev_start)
 
@@ -102,8 +116,10 @@ if weighted + n <= limit then
 	allowed = 1
 	if n > 0 then
 		cur = redis.call('HINCRBY', KEYS[1], cur_field, n)
+		redis.call('HSET', KEYS[1], '__last_now', string.format('%.0f', now))
 		for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
-			if tonumber(field) < prev_start then
+			local field_time = tonumber(field)
+			if field_time ~= nil and field_time < prev_start then
 				redis.call('HDEL', KEYS[1], field)
 			end
 		end
@@ -111,14 +127,13 @@ if weighted + n <= limit then
 	end
 end
 
--- Microsecond timestamps stay below 2^53, so the Lua-to-integer
--- conversion of these numbers is exact.
-return {allowed, cur, prev, cur_start, now}
+return {allowed, cur, prev, string.format('%.0f', cur_start), string.format('%.0f', now)}
 `)
 
 // takeTokensScript implements token-bucket admission in one atomic step.
-// State is the token count plus the last-refill timestamp, stored with
-// microsecond precision as fractional unix seconds.
+// State is the token count plus a Redis-clock timestamp in integer unix
+// microseconds. A clock rollback is clamped to the last committed timestamp.
+// Denials consume nothing; peeks and denials do not write state.
 //
 // KEYS[1] bucket key
 // ARGV[1] capacity
@@ -126,8 +141,7 @@ return {allowed, cur, prev, cur_start, now}
 // ARGV[3] tokens requested (0 = read-only peek)
 // ARGV[4] TTL, seconds
 //
-// Returns {allowed, tokensAfter}. Nothing is written on denial or peek: the
-// stored (tokens, ts) pair regenerates the same balance on the next call.
+// Returns {allowed, tokensAfter, nowMicros}.
 var takeTokensScript = redis.NewScript(`
 local capacity = tonumber(ARGV[1])
 local refill = tonumber(ARGV[2])
@@ -135,17 +149,25 @@ local n = tonumber(ARGV[3])
 local ttl = tonumber(ARGV[4])
 
 local t = redis.call('TIME')
-local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local now_us = tonumber(t[1]) * 1000000 + tonumber(t[2])
 
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+-- Read the legacy fractional-second field too so upgrades do not reset
+-- existing buckets.
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts_us', 'ts')
 local tokens = tonumber(state[1])
-local ts = tonumber(state[2])
-if tokens == nil or ts == nil then
+local ts_us = tonumber(state[2])
+if ts_us == nil and state[3] ~= false then
+	ts_us = tonumber(state[3]) * 1000000
+end
+if tokens == nil or ts_us == nil then
 	tokens = capacity
-	ts = now
+	ts_us = now_us
+end
+if now_us < ts_us then
+	now_us = ts_us
 end
 
-local elapsed = now - ts
+local elapsed = (now_us - ts_us) / 1000000
 if elapsed > 0 then
 	tokens = tokens + elapsed * refill
 	if tokens > capacity then
@@ -158,23 +180,30 @@ if n <= tokens then
 	allowed = 1
 	if n > 0 then
 		tokens = tokens - n
-		-- %.6f keeps microsecond precision and never falls back to the
-		-- scientific notation tostring would produce.
-		redis.call('HSET', KEYS[1], 'tokens', string.format('%.6f', tokens), 'ts', string.format('%.6f', now))
+		redis.call('HSET', KEYS[1],
+			'tokens', string.format('%.17g', tokens),
+			'ts_us', string.format('%.0f', now_us))
+		redis.call('HDEL', KEYS[1], 'ts')
 		redis.call('EXPIRE', KEYS[1], ttl)
 	end
 end
 
-return {allowed, string.format('%.6f', tokens)}
+return {allowed, string.format('%.17g', tokens), string.format('%.0f', now_us)}
 `)
 
 // IncrWindow implements limiter.Store.
 func (rs *RedisStore) IncrWindow(ctx context.Context, key string, window time.Duration, n, limit int64, weightPrev bool, ttl time.Duration) (*limiter.WindowResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateWindowOperation(window, n, limit, weightPrev, ttl); err != nil {
+		return nil, err
+	}
+
 	weigh := 0
 	if weightPrev {
 		weigh = 1
 	}
-
 	raw, err := incrWindowScript.Run(ctx, rs.client, []string{"rl:" + key},
 		window.Microseconds(), n, limit, weigh, ttlSeconds(ttl)).Result()
 	if err != nil {
@@ -187,12 +216,12 @@ func (rs *RedisStore) IncrWindow(ctx context.Context, key string, window time.Du
 	}
 
 	var fields [5]int64
-	for i, v := range reply {
-		f, err := replyInt(v)
+	for i, value := range reply {
+		parsed, err := replyInt(value)
 		if err != nil {
-			return nil, fmt.Errorf("redis window increment: %w", err)
+			return nil, fmt.Errorf("redis window increment field %d: %w", i, err)
 		}
-		fields[i] = f
+		fields[i] = parsed
 	}
 
 	return &limiter.WindowResult{
@@ -205,31 +234,49 @@ func (rs *RedisStore) IncrWindow(ctx context.Context, key string, window time.Du
 }
 
 // TakeTokens implements limiter.Store.
-func (rs *RedisStore) TakeTokens(ctx context.Context, key string, capacity, refillPerSec, n float64, ttl time.Duration) (bool, float64, error) {
+func (rs *RedisStore) TakeTokens(ctx context.Context, key string, capacity, refillPerSec, n float64, ttl time.Duration) (*limiter.TokenResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateTokenOperation(capacity, refillPerSec, n, ttl); err != nil {
+		return nil, err
+	}
+
 	raw, err := takeTokensScript.Run(ctx, rs.client, []string{"rl:" + key},
 		formatFloat(capacity), formatFloat(refillPerSec), formatFloat(n), ttlSeconds(ttl)).Result()
 	if err != nil {
-		return false, 0, fmt.Errorf("redis token take: %w", err)
+		return nil, fmt.Errorf("redis token take: %w", err)
 	}
 
 	reply, ok := raw.([]interface{})
-	if !ok || len(reply) != 2 {
-		return false, 0, fmt.Errorf("redis token take: unexpected reply %T", raw)
+	if !ok || len(reply) != 3 {
+		return nil, fmt.Errorf("redis token take: unexpected reply %T", raw)
 	}
 
 	allowed, err := replyInt(reply[0])
 	if err != nil {
-		return false, 0, fmt.Errorf("redis token take: %w", err)
+		return nil, fmt.Errorf("redis token take allowed: %w", err)
 	}
 	tokens, err := replyFloat(reply[1])
 	if err != nil {
-		return false, 0, fmt.Errorf("redis token take: %w", err)
+		return nil, fmt.Errorf("redis token take balance: %w", err)
 	}
-	return allowed == 1, tokens, nil
+	nowUS, err := replyInt(reply[2])
+	if err != nil {
+		return nil, fmt.Errorf("redis token take clock: %w", err)
+	}
+	return &limiter.TokenResult{
+		Allowed: allowed == 1,
+		Tokens:  tokens,
+		Now:     time.UnixMicro(nowUS),
+	}, nil
 }
 
 // Delete implements limiter.Store.
 func (rs *RedisStore) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := rs.client.Del(ctx, "rl:"+key).Err(); err != nil {
 		return fmt.Errorf("redis delete: %w", err)
 	}
@@ -238,46 +285,59 @@ func (rs *RedisStore) Delete(ctx context.Context, key string) error {
 
 // Ping implements limiter.Store.
 func (rs *RedisStore) Ping(ctx context.Context) error {
-	return rs.client.Ping(ctx).Err()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := rs.client.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("redis ping: %w", err)
+	}
+	return nil
 }
 
 // Close implements limiter.Store.
-func (rs *RedisStore) Close() error {
-	return rs.client.Close()
-}
+func (rs *RedisStore) Close() error { return rs.client.Close() }
 
 // ttlSeconds converts a duration to whole seconds for EXPIRE, rounding up so
 // state never expires before the algorithm expects it to.
 func ttlSeconds(ttl time.Duration) int64 {
-	secs := int64((ttl + time.Second - 1) / time.Second)
-	if secs < 1 {
-		secs = 1
+	seconds := int64(ttl / time.Second)
+	if ttl%time.Second != 0 {
+		seconds++
 	}
-	return secs
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
 }
 
-func formatFloat(f float64) string {
-	return strconv.FormatFloat(f, 'f', -1, 64)
+func formatFloat(value float64) string {
+	return strconv.FormatFloat(value, 'g', -1, 64)
 }
 
-func replyInt(v interface{}) (int64, error) {
-	switch t := v.(type) {
+func replyInt(value interface{}) (int64, error) {
+	switch typed := value.(type) {
 	case int64:
-		return t, nil
+		return typed, nil
 	case string:
-		return strconv.ParseInt(t, 10, 64)
+		return strconv.ParseInt(typed, 10, 64)
+	case []byte:
+		return strconv.ParseInt(string(typed), 10, 64)
 	default:
-		return 0, fmt.Errorf("unexpected reply element %T", v)
+		return 0, fmt.Errorf("unexpected reply element %T", value)
 	}
 }
 
-func replyFloat(v interface{}) (float64, error) {
-	switch t := v.(type) {
+func replyFloat(value interface{}) (float64, error) {
+	switch typed := value.(type) {
 	case string:
-		return strconv.ParseFloat(t, 64)
+		return strconv.ParseFloat(typed, 64)
+	case []byte:
+		return strconv.ParseFloat(string(typed), 64)
 	case int64:
-		return float64(t), nil
+		return float64(typed), nil
+	case float64:
+		return typed, nil
 	default:
-		return 0, fmt.Errorf("unexpected reply element %T", v)
+		return 0, fmt.Errorf("unexpected reply element %T", value)
 	}
 }

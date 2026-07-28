@@ -1,11 +1,14 @@
 # Rate limiter service configuration.
-# Environment overrides: PORT, STORE, REDIS_ADDR (comma-separated), REDIS_PASSWORD.
+# Environment overrides: PORT, STORE, REDIS_ADDR (one standalone endpoint),
+# REDIS_PASSWORD, ALLOW_POLICY_OVERRIDES, RESET_TOKEN.
 
 server:
   port: 8080
+  read_header_timeout: 2s
   read_timeout: 5s
   write_timeout: 10s
   idle_timeout: 120s
+  decision_timeout: 2s
 
 # "memory" for a single instance, "redis" for distributed deployments.
 store: memory
@@ -21,6 +24,11 @@ algorithms:
   # token_bucket | sliding_window | fixed_window
   default: token_bucket
 
+api:
+  # Keep false when requests come directly from untrusted clients. Enabling
+  # this lets a trusted gateway or test client select algorithm and tier.
+  allow_policy_overrides: false
+
 limits:
   # Applied when a request names no tier.
   default:
@@ -28,7 +36,8 @@ limits:
     window: 1m
     burst: 120
 
-  # Optional named tiers, selected per request via the "tier" field.
+  # Optional named tiers. The request "tier" field is accepted only when
+  # api.allow_policy_overrides is enabled behind a trusted gateway.
   tiers:
     free:
       requests: 100

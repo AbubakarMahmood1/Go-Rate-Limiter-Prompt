@@ -3,10 +3,14 @@ package algorithms
 import (
 	"context"
 	"fmt"
+	"math"
+	"math/big"
 	"time"
 
 	"github.com/AbubakarMahmood/go-rate-limiter/pkg/limiter"
 )
+
+const maxDuration = time.Duration(1<<63 - 1)
 
 // TokenBucket refills a bucket of capacity tokens at a constant rate; each
 // request consumes tokens. It shapes traffic to a smooth average rate while
@@ -28,14 +32,19 @@ func NewTokenBucket(store limiter.Store, config limiter.Config) *TokenBucket {
 	}
 	refillPerSec := float64(config.Limit) / config.Window.Seconds()
 
+	refillDuration := fullRefillDuration(capacity, config.Limit, config.Window)
+	ttl := refillDuration
+	if ttl <= maxDuration-time.Second {
+		ttl += time.Second
+	}
+
 	return &TokenBucket{
 		store:        store,
 		capacity:     capacity,
 		refillPerSec: refillPerSec,
-		// Give idle state exactly as long as a full refill takes, plus
-		// slack: an evicted bucket re-initializes full, so expiring any
-		// earlier would hand out tokens ahead of schedule.
-		ttl: durationFromSeconds(float64(capacity)/refillPerSec) + time.Second,
+		// An evicted bucket re-initializes full, so state must live for at
+		// least one complete refill plus slack.
+		ttl: ttl,
 	}
 }
 
@@ -46,27 +55,28 @@ func (tb *TokenBucket) Allow(ctx context.Context, key string) (*limiter.Result, 
 
 // AllowN implements limiter.RateLimiter.
 func (tb *TokenBucket) AllowN(ctx context.Context, key string, n int) (*limiter.Result, error) {
-	if n < 0 {
+	if n <= 0 {
 		return nil, limiter.ErrInvalidCount
 	}
 	if n > tb.capacity {
 		return nil, limiter.ErrExceedsLimit
 	}
 
-	allowed, tokens, err := tb.store.TakeTokens(ctx, "tb:"+key, float64(tb.capacity), tb.refillPerSec, float64(n), tb.ttl)
+	state, err := tb.store.TakeTokens(ctx, "tb:"+key, float64(tb.capacity), tb.refillPerSec, float64(n), tb.ttl)
 	if err != nil {
 		return nil, fmt.Errorf("token bucket: %w", err)
 	}
-	return tb.result(allowed, tokens, n), nil
+	return tb.result(state, n), nil
 }
 
 // Peek implements limiter.RateLimiter.
 func (tb *TokenBucket) Peek(ctx context.Context, key string) (*limiter.Result, error) {
-	_, tokens, err := tb.store.TakeTokens(ctx, "tb:"+key, float64(tb.capacity), tb.refillPerSec, 0, tb.ttl)
+	state, err := tb.store.TakeTokens(ctx, "tb:"+key, float64(tb.capacity), tb.refillPerSec, 0, tb.ttl)
 	if err != nil {
 		return nil, fmt.Errorf("token bucket: %w", err)
 	}
-	return tb.result(tokens >= 1, tokens, 1), nil
+	state.Allowed = state.Tokens >= 1
+	return tb.result(state, 1), nil
 }
 
 // Reset implements limiter.RateLimiter.
@@ -74,23 +84,59 @@ func (tb *TokenBucket) Reset(ctx context.Context, key string) error {
 	return tb.store.Delete(ctx, "tb:"+key)
 }
 
-func (tb *TokenBucket) result(allowed bool, tokens float64, n int) *limiter.Result {
-	r := &limiter.Result{
-		Allowed:   allowed,
-		Limit:     tb.capacity,
-		Remaining: int(tokens),
-		// ResetAt reports when the bucket will be full again at the
-		// current refill rate.
-		ResetAt: time.Now().Add(durationFromSeconds((float64(tb.capacity) - tokens) / tb.refillPerSec)),
+func (tb *TokenBucket) result(state *limiter.TokenResult, n int) *limiter.Result {
+	remaining := int(math.Floor(state.Tokens))
+	if remaining < 0 {
+		remaining = 0
 	}
-	if !allowed {
-		r.RetryAfter = durationFromSeconds((float64(n) - tokens) / tb.refillPerSec)
+	if remaining > tb.capacity {
+		remaining = tb.capacity
+	}
+
+	untilFull := durationFromSecondsCeil((float64(tb.capacity) - state.Tokens) / tb.refillPerSec)
+	r := &limiter.Result{
+		Allowed:   state.Allowed,
+		Limit:     tb.capacity,
+		Remaining: remaining,
+		ResetAt:   state.Now.Add(untilFull),
+	}
+	if !state.Allowed {
+		r.RetryAfter = durationFromSecondsCeil((float64(n) - state.Tokens) / tb.refillPerSec)
 	}
 	return r
 }
 
-// durationFromSeconds converts fractional seconds without the truncation
-// that time.Duration(int) * time.Second would introduce.
-func durationFromSeconds(s float64) time.Duration {
-	return time.Duration(s * float64(time.Second))
+// durationFromSecondsCeil converts fractional seconds to a duration while
+// rounding up to the stores' microsecond clock resolution. A retry/reset
+// timestamp must never land inside the same backend clock tick.
+func durationFromSecondsCeil(seconds float64) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	micros := math.Ceil(seconds * 1e6)
+	maxMicros := float64(maxDuration / time.Microsecond)
+	if micros >= maxMicros {
+		return maxDuration
+	}
+	return time.Duration(micros) * time.Microsecond
+}
+
+// fullRefillDuration computes ceil(window*capacity/limit) without overflowing
+// time.Duration. Configuration validation rejects values that would saturate;
+// the defensive cap keeps direct internal callers safe as well.
+func fullRefillDuration(capacity, limit int, window time.Duration) time.Duration {
+	if capacity <= 0 || limit <= 0 || window <= 0 {
+		return 0
+	}
+
+	numerator := new(big.Int).Mul(big.NewInt(int64(window)), big.NewInt(int64(capacity)))
+	quotient, remainder := new(big.Int), new(big.Int)
+	quotient.QuoRem(numerator, big.NewInt(int64(limit)), remainder)
+	if remainder.Sign() > 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	if !quotient.IsInt64() || quotient.Int64() > int64(maxDuration-time.Second) {
+		return maxDuration - time.Second
+	}
+	return time.Duration(quotient.Int64())
 }

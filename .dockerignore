@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+bin
+coverage.out
+coverage.html
+load-test-results
+*.exe
+*.log
+*.prof
+*.test

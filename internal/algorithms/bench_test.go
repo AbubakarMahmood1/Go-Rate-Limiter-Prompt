@@ -2,7 +2,7 @@ package algorithms_test
 
 import (
 	"context"
-	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -13,7 +13,15 @@ import (
 
 // benchConfig keeps every request under the limit so benchmarks measure the
 // admission path, not denial short-circuits.
-var benchConfig = limiter.Config{Limit: 1 << 30, Window: time.Second, Burst: 1 << 30}
+var benchConfig = limiter.Config{Limit: 1 << 40, Window: time.Hour, Burst: 1 << 40}
+
+func benchmarkKeys() []string {
+	keys := make([]string, 100)
+	for i := range keys {
+		keys[i] = "key-" + strconv.Itoa(i)
+	}
+	return keys
+}
 
 func benchLimiters(s limiter.Store) map[string]limiter.RateLimiter {
 	return map[string]limiter.RateLimiter{
@@ -29,6 +37,7 @@ func BenchmarkAllow(b *testing.B) {
 	s := store.NewMemoryStore()
 	defer s.Close()
 	ctx := context.Background()
+	keys := benchmarkKeys()
 
 	for name, lim := range benchLimiters(s) {
 		b.Run(name, func(b *testing.B) {
@@ -36,7 +45,7 @@ func BenchmarkAllow(b *testing.B) {
 			b.RunParallel(func(pb *testing.PB) {
 				i := 0
 				for pb.Next() {
-					_, _ = lim.Allow(ctx, fmt.Sprintf("key-%d", i%100))
+					_, _ = lim.Allow(ctx, keys[i%len(keys)])
 					i++
 				}
 			})
@@ -68,6 +77,7 @@ func BenchmarkPeek(b *testing.B) {
 	s := store.NewMemoryStore()
 	defer s.Close()
 	ctx := context.Background()
+	keys := benchmarkKeys()
 
 	for name, lim := range benchLimiters(s) {
 		b.Run(name, func(b *testing.B) {
@@ -75,7 +85,7 @@ func BenchmarkPeek(b *testing.B) {
 			b.RunParallel(func(pb *testing.PB) {
 				i := 0
 				for pb.Next() {
-					_, _ = lim.Peek(ctx, fmt.Sprintf("key-%d", i%100))
+					_, _ = lim.Peek(ctx, keys[i%len(keys)])
 					i++
 				}
 			})

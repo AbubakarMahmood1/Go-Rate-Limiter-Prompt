@@ -1,185 +1,252 @@
 # go-rate-limiter
 
 [![CI](https://github.com/AbubakarMahmood/go-rate-limiter/actions/workflows/ci.yml/badge.svg)](https://github.com/AbubakarMahmood/go-rate-limiter/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A standalone rate-limiting service in Go. Other services call its HTTP API to ask "may this client do this thing right now?" and get an authoritative, atomic answer — with standard `X-RateLimit-*` headers, tiered limits, and Prometheus metrics included.
+> One request produces one atomic, explainable admission decision. Under contention, the service admits no more permits than the configured policy allows.
 
-- **Three algorithms**: token bucket, sliding window counter, fixed window counter — selectable per request.
-- **Two storage backends**: in-memory for a single instance, Redis for a fleet. Every decision is a single atomic operation (a per-key critical section in memory, a Lua script in Redis), so concurrent requests can never over-admit — this is tested, not assumed.
-- **Tiered limits**: named tiers (e.g. `free`, `premium`) with independent budgets, defined in config and selected per request.
-- **Observability**: Prometheus metrics with a provisioned Grafana dashboard in the Compose stack.
+`go-rate-limiter` is a small HTTP service for answering: **may this identity perform this action now?** It implements token-bucket, weighted sliding-window, and fixed-window policies over either an in-process store or one standalone Redis server.
 
-## Quick start
+The central contract is deliberately narrow:
 
-```bash
-# Run directly (in-memory store, config.yaml optional)
-go run ./cmd/server
+- A multi-permit request is all-or-nothing; a denial consumes nothing.
+- Memory and Redis execute each decision atomically.
+- Redis-backed decisions use Redis `TIME`, not an application instance's clock.
+- Status is observational: it neither consumes permits nor extends state lifetime.
+- Dependency failures fail closed with `503`; they never become implicit allows.
+- Public claims are tied to tests or committed verification commands.
 
-# Or run the full stack: service + Redis + Prometheus + Grafana
-make docker-up
+## Architecture
+
+```mermaid
+flowchart LR
+    C[Caller or trusted gateway] -->|POST /v1/check| H[HTTP boundary\nvalidate identity, policy, count]
+    H --> A{Configured algorithm}
+    A --> TB[Token bucket]
+    A --> SW[Weighted sliding window]
+    A --> FW[Fixed window]
+    TB --> S{Atomic store operation}
+    SW --> S
+    FW --> S
+    S --> M[Memory\nper-key mutex\nsingle process clock]
+    S --> R[Standalone Redis\nLua script\nRedis TIME]
+    A -->|allow / deny, remaining, safe retry| H
+    H --> RESP[HTTP response\nrate-limit headers]
+    H --> MET[Prometheus\nbounded labels only]
 ```
 
-Check a request:
+Atomicity belongs to the store. The algorithms contain no mutable shared state and cannot split a decision into an unsafe read followed by a write.
+
+## Fastest complete demonstration
+
+With Docker and Compose installed:
 
 ```bash
-curl -s -X POST http://localhost:8080/v1/check \
+make smoke-compose
+```
+
+That command builds the image, starts the service with Redis, Prometheus, and Grafana, then proves:
+
+1. health, allow, deny, status, authenticated reset, and metrics;
+2. Prometheus is actually scraping the service;
+3. Grafana provisioned the committed dashboard; and
+4. Redis loss causes health and admission to return `503`, followed by recovery.
+
+The stack is removed afterward unless `KEEP_STACK=1` is set.
+
+For a direct in-memory run:
+
+```bash
+RESET_TOKEN=local-development-reset-token go run ./cmd/server
+```
+
+In another shell:
+
+```bash
+RESET_TOKEN=local-development-reset-token make smoke
+```
+
+The direct path loads `./config.yaml` when it exists, or validated built-in defaults otherwise. A path supplied with `CONFIG_FILE` must exist and parse successfully; startup never silently substitutes defaults for a bad explicit file.
+
+## HTTP contract
+
+| Method | Path | Meaning |
+|---|---|---|
+| `POST` | `/v1/check` | Decide atomically and consume permits only when allowed. |
+| `GET` | `/v1/status?identifier=...&resource=...` | Read current state without consuming or refreshing it. |
+| `POST` | `/v1/reset?identifier=...&resource=...` | Operational reset; disabled unless `RESET_TOKEN` is configured. |
+| `GET` | `/health` | `200` only when the configured store can answer. |
+| `GET` | `/metrics` | Prometheus exposition when metrics are enabled. |
+
+### Check
+
+```bash
+curl -i -X POST http://localhost:8080/v1/check \
   -H 'Content-Type: application/json' \
-  -d '{"resource": "api.users.create", "identifier": "user-123"}'
+  -d '{"resource":"api.orders.create","identifier":"user-123","count":3}'
 ```
+
+A successful decision returns `200`:
 
 ```json
 {
   "allowed": true,
   "limit": 120,
-  "remaining": 119,
-  "reset_at": "2026-07-15T17:32:47Z"
+  "remaining": 117,
+  "reset_at": "2026-07-26T12:34:56.789Z"
 }
 ```
 
-When the budget is spent the service answers `429` with a `Retry-After` header and the same JSON shape plus `retry_after` (seconds, rounded up).
+A normal policy denial returns `429`, includes a positive `Retry-After` header, and adds `retry_after` in whole seconds. The service also emits `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`; reset timestamps are rounded up rather than advertised early.
 
-> With the Compose stack the service listens on **:8081**, Prometheus on :9090, Grafana on :3000 (admin/admin).
+`count` defaults to one only when omitted. Zero, null, negative, fractional, or policy-impossible counts are `400` errors. Bodies are limited to 8 KiB, unknown JSON fields are rejected, and identifiers/resources must be valid bounded UTF-8 without outer whitespace or control characters.
 
-## API
+### Policy boundary
 
-| Method | Path              | Purpose                                                        |
-|--------|-------------------|----------------------------------------------------------------|
-| `POST` | `/v1/check`       | Decide and consume: may `identifier` access `resource` now?    |
-| `GET`  | `/v1/status/:key` | Current state for `identifier:resource` — never consumes       |
-| `POST` | `/v1/reset/:key`  | Clear state for one key (operational/admin use)                |
-| `GET`  | `/health`         | `200` when the store answers, `503` otherwise                  |
-| `GET`  | `/metrics`        | Prometheus metrics                                             |
+Clients do **not** choose a more generous algorithm or tier by default. When `api.allow_policy_overrides` is false, supplying `algorithm` or `tier` is rejected.
 
-### `POST /v1/check`
-
-```json
-{
-  "resource":   "api.users.create",   // required — what is being accessed
-  "identifier": "user-123",           // required — who is accessing it
-  "algorithm":  "sliding_window",     // optional — override the default
-  "tier":       "premium",            // optional — use a configured tier's limits
-  "count":      3                     // optional — consume several permits at once (default 1)
-}
-```
-
-`count` is all-or-nothing: either all permits are granted or none are, and a denied request consumes nothing. A `count` that exceeds the configured limit can never succeed and is rejected with `400` rather than `429`.
-
-Every decision carries the standard headers:
-
-```http
-X-RateLimit-Limit: 120
-X-RateLimit-Remaining: 117
-X-RateLimit-Reset: 1783532167
-Retry-After: 12          (only on 429)
-```
+`ALLOW_POLICY_OVERRIDES=true` is intended only behind a trusted gateway or for the local Compose demonstration. Named tiers remain configuration-defined and therefore finite.
 
 ### Status and reset
 
-`/v1/status` and `/v1/reset` take the same `identifier:resource` pair as the path key, with `algorithm` and `tier` as query parameters:
-
 ```bash
-curl -s 'http://localhost:8080/v1/status/user-123:api.users.create?algorithm=token_bucket'
-curl -s -X POST 'http://localhost:8080/v1/reset/user-123:api.users.create'
+curl -s 'http://localhost:8080/v1/status?identifier=user-123&resource=api.orders.create'
+
+curl -s -X POST \
+  -H 'Authorization: Bearer local-development-reset-token' \
+  'http://localhost:8080/v1/reset?identifier=user-123&resource=api.orders.create'
 ```
 
-Status is a true read: it reports `remaining` without consuming permits.
+Reset is not a public client capability. It returns `404` when `RESET_TOKEN` is absent and requires a bearer token when enabled. The secret is environment-only and must be at least 16 bytes.
+
+The internal subject key uses byte-length framing, so values such as `identifier=a:b, resource=c` cannot collide with `identifier=a, resource=b:c`.
 
 ## Algorithms
 
-| Algorithm        | Behaviour                                                                 | Trade-off                                                       |
-|------------------|---------------------------------------------------------------------------|-----------------------------------------------------------------|
-| `token_bucket`   | Refills continuously at `requests/window`; bursts up to `burst`           | Best for smoothing traffic while tolerating short spikes        |
-| `sliding_window` | Weights the previous window by its remaining overlap: `cur + prev×w`      | Near-accurate limiting with two counters per key                |
-| `fixed_window`   | One counter per window                                                     | Cheapest, but admits up to 2× the limit across a window boundary |
+| Algorithm | Rule | Useful property | Explicit trade-off |
+|---|---|---|---|
+| `token_bucket` | Refill continuously at `requests/window`; hold at most `burst` permits. | Smooth average rate with controlled bursts. | Uses fractional token state. |
+| `sliding_window` | `current + previous × (1 - elapsed/window)` | Smooths fixed-window boundaries with O(1) state. | A weighted approximation; it assumes prior-window requests were evenly distributed. |
+| `fixed_window` | Count permits in aligned windows. | Smallest and simplest state. | Can admit nearly twice the limit across a boundary. |
 
-The default algorithm is set in config; each request may override it. The three algorithms keep separate state, so switching algorithms never inherits stale counts.
+For every algorithm, an allowed `count=n` consumes exactly `n`; a denied request consumes zero. Algorithms have separate key namespaces, so changing policy does not accidentally reuse another algorithm's state.
+
+`Retry-After` is computed at microsecond store-clock resolution and rounded up for HTTP. Sliding-window retry math can cross into the next window when merely reaching the current boundary would still be too early.
+
+The complete formulas, reset semantics, TTL rules, and boundary behavior are in [docs/SEMANTICS.md](docs/SEMANTICS.md).
+
+## Backends and guarantees
+
+| Backend | Supported shape | Clock | Atomic mechanism | What is not claimed |
+|---|---|---|---|---|
+| Memory | One service process | Process clock, clamped per committed key | Per-key mutex | Cross-process or horizontal consistency |
+| Redis | Multiple service instances sharing one standalone Redis endpoint | Redis `TIME` | One Lua script per decision | Cluster, Sentinel, automatic failover, or multi-region guarantees |
+
+State expiry is derived from algorithm mathematics, not used as an arbitrary cache timeout. Window data lives until it can no longer affect a decision. Token state lives through a complete refill, so expiry is observationally equivalent to a full bucket.
+
+## Failure and observability policy
+
+Backend errors and decision timeouts return `503 Service Unavailable` with `Retry-After: 1`. Error details are logged in structured JSON but are not reflected to callers. `/health` uses the real store and also returns `503` when decisions cannot be made.
+
+Prometheus exposes:
+
+- `rate_limiter_decisions_total{algorithm,tier,result}`
+- `rate_limiter_decision_duration_seconds{algorithm,tier,result}`
+
+`result` is one of `allowed`, `denied`, `invalid`, or `error`. Labels contain only implemented algorithms, configured tiers, and this finite result set. Caller-controlled identifiers and resources never become labels. Metrics cover requests that reached a resolved limiter decision; malformed requests rejected before policy resolution are not included.
+
+The provisioned Grafana dashboard is an operational view, not proof of correctness.
+
+## Verification
+
+| Claim | Executable evidence |
+|---|---|
+| Exact admission under contention, memory | `TestConcurrentAdmissionIsExact` |
+| Exact admission under contention, Redis | `TestRedisAlgorithms_ConcurrentAdmissionIsExact` |
+| Denied bulk requests consume nothing | Algorithm and Redis integration tests |
+| Status/denials do not mutate committed state | Memory, Redis, and handler regression tests |
+| Memory/Redis visible-decision parity | `TestRedisAlgorithms_MatchMemoryVisibleDecisions` |
+| Safe retry math across window boundaries | Sliding-window retry regression tests |
+| Bounded metric labels | `TestMetricsUseOnlyBoundedLabels` |
+| Fail-closed dependency behavior | Handler tests and `scripts/compose-smoke-test.sh` |
+| Redis integration cannot silently skip in CI | `REQUIRE_REDIS=1` in `.github/workflows/ci.yml` |
+| Reachable dependency advisories | `make vuln` with pinned `govulncheck` |
+
+Run the infrastructure-free gate with Go 1.25 or newer:
+
+```bash
+make verify
+```
+
+Run the pinned reachable-code vulnerability scan:
+
+```bash
+make vuln
+```
+
+Run the Redis gate against one standalone Redis endpoint:
+
+```bash
+REDIS_ADDR=127.0.0.1:6379 make test-redis
+```
+
+Run the complete container gate:
+
+```bash
+make smoke-compose
+```
+
+CI pins the build toolchain and Redis image, runs formatting, vet, build, the race detector, required Redis integration tests, an image smoke test, and the full Compose failure/recovery test. See [docs/VERIFICATION.md](docs/VERIFICATION.md) for the audited snapshot and current evidence status.
+
+## Performance claims
+
+`make bench` runs Go microbenchmarks for the algorithm plus **in-memory** store only, using precomputed keys. It does not measure HTTP, Redis round trips, deployment p50/p95/p99, or production throughput.
+
+No numerical performance result is treated as a durable repository claim. Record the command, commit, Go version, CPU, operating system, and repeated samples before publishing a comparison. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+`scripts/load-test.sh` can drive a running HTTP service with Vegeta when that tool is installed. Its output is an environment-specific experiment, not a checked-in latency promise.
 
 ## Configuration
 
-`config.yaml` (all keys optional — built-in defaults apply):
+The committed [config.yaml](config.yaml) documents every key. Important environment overrides are:
 
-```yaml
-server:
-  port: 8080
-  read_timeout: 5s
-  write_timeout: 10s
+| Variable | Purpose |
+|---|---|
+| `CONFIG_FILE` | Require a specific YAML file. |
+| `PORT` | HTTP port. |
+| `STORE` | `memory` or `redis`. |
+| `REDIS_ADDR` | Exactly one standalone Redis address. |
+| `REDIS_PASSWORD` | Redis password. |
+| `ALLOW_POLICY_OVERRIDES` | Permit trusted callers to select algorithm/tier. |
+| `RESET_TOKEN` | Enable authenticated operational reset. |
 
-store: memory            # memory | redis
+Unknown YAML keys, multiple YAML documents, non-positive timeouts, invalid windows/counts, unsafe retention combinations, invalid metric paths, and unsupported Redis address shapes fail startup.
 
-redis:
-  addresses: [localhost:6379]
-  pool_size: 100
+## Known limits
 
-algorithms:
-  default: token_bucket  # token_bucket | sliding_window | fixed_window
+- Redis support is deliberately standalone only.
+- The memory backend is deliberately single-process only.
+- Sliding-window counting is a weighted approximation, not an exact event log.
+- There is no tenant/authentication system, policy database, billing layer, or public reset authorization model.
+- The service fails closed; availability therefore depends on the selected store.
+- The HTTP API is JSON over HTTP/1.1 or HTTP/2 as provided by the Go server; no gRPC contract is claimed.
 
-limits:
-  default:
-    requests: 100        # permits per window
-    window: 1m
-    burst: 120           # token-bucket capacity (defaults to requests)
-  tiers:
-    premium:
-      requests: 10000
-      window: 1h
-      burst: 12000
+Operational guidance is in [docs/OPERATIONS.md](docs/OPERATIONS.md), and security boundaries are in [SECURITY.md](SECURITY.md).
 
-metrics:
-  enabled: true
-  path: /metrics
-```
+## Project layout
 
-Environment overrides (useful in containers): `PORT`, `STORE`, `REDIS_ADDR` (comma-separated for cluster), `REDIS_PASSWORD`, and `CONFIG_FILE` to point at a different file. A malformed config file fails startup loudly rather than silently falling back to defaults.
-
-## Design notes
-
-**Atomicity lives in the store.** Algorithms are stateless; each decision compiles down to one atomic store operation. The Redis backend runs the entire read-evaluate-increment sequence as a Lua script on the server, so any number of service instances share correct limits without coordination. The in-memory backend takes a per-key mutex — unrelated keys never contend. A concurrency test asserts that 300 parallel requests against a limit of 100 admit *exactly* 100, on both backends.
-
-**Clocks.** Redis decisions use the Redis server clock (`TIME` inside the script), making instances with skewed local clocks consistent with each other.
-
-**TTLs are derived, not configured.** Window state expires after two windows (when it can no longer influence a decision); bucket state expires after exactly the time a full refill would take, so eviction is indistinguishable from refilling. Idle keys cost nothing in either backend.
-
-**Retry math doesn't truncate.** `retry_after` is computed from the actual refill rate or window overlap with sub-second precision, then rounded *up* to whole seconds for the header — a denied client is never told to retry too early.
-
-**Known limits.** The sliding window is the standard weighted approximation (it assumes requests in the previous window were evenly distributed). The in-memory store is per-instance by design — run Redis when there is more than one instance.
-
-## Performance
-
-`make bench` on a Ryzen 7 5800H (Windows, Go 1.26, in-memory store):
-
-| Benchmark                    | token_bucket | sliding_window | fixed_window |
-|------------------------------|--------------|----------------|--------------|
-| Parallel, 100 keys           | 66 ns/op     | 93 ns/op       | 97 ns/op     |
-| Parallel, single hot key     | 139 ns/op    | 234 ns/op      | 220 ns/op    |
-| Allocations per decision     | 80 B / 3     | 160 B / 4      | 160 B / 4    |
-
-These measure the decision path (algorithm + store); end-to-end HTTP latency is dominated by the network and, for the Redis backend, one round trip per decision.
-
-There is also a [vegeta](https://github.com/tsenart/vegeta) script for load-testing a running instance: `./scripts/load-test.sh`.
-
-## Development
-
-```bash
-make test           # unit + handler tests, race detector
-make bench          # algorithm benchmarks
-make docker-up      # full stack with provisioned Grafana dashboard
-```
-
-The Redis integration tests run automatically when `REDIS_ADDR` is set and skip otherwise; CI runs them against a Redis service container, along with `gofmt`, `go vet`, the race detector, and a Docker image smoke test.
-
-### Project layout
-
-```
-cmd/server/          entry point, wiring
-internal/algorithms/ token bucket, sliding window, fixed window
-internal/store/      memory and Redis backends (atomic ops, Lua scripts)
-internal/handlers/   HTTP API
-internal/config/     YAML config, env overrides, validation
-internal/metrics/    Prometheus collectors
-pkg/limiter/         core interfaces shared by the above
-docker/              Dockerfile, Compose stack, Prometheus & Grafana provisioning
+```text
+cmd/server/          service wiring, HTTP lifecycle, structured logs
+internal/algorithms/ token bucket, weighted sliding window, fixed window
+internal/store/      atomic memory and standalone Redis implementations
+internal/handlers/   HTTP validation, policy boundary, headers, reset
+internal/config/     strict YAML/env loading and validation
+internal/metrics/    bounded Prometheus collectors
+pkg/limiter/         shared contracts and result types
+docker/              image, Compose, Prometheus, Grafana provisioning
+scripts/             direct, Compose, and load-test verification
+docs/                semantics, operations, benchmarks, evidence
 ```
 
 ## License

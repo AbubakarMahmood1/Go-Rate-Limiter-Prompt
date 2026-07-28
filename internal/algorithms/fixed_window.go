@@ -32,7 +32,7 @@ func NewFixedWindowCounter(store limiter.Store, config limiter.Config) *FixedWin
 		window: config.Window,
 		// Once two windows have passed, expired state is indistinguishable
 		// from a zero counter, so it is safe to evict.
-		ttl: 2*config.Window + time.Second,
+		ttl: windowRetention(config.Window),
 	}
 }
 
@@ -43,7 +43,7 @@ func (f *FixedWindowCounter) Allow(ctx context.Context, key string) (*limiter.Re
 
 // AllowN implements limiter.RateLimiter.
 func (f *FixedWindowCounter) AllowN(ctx context.Context, key string, n int) (*limiter.Result, error) {
-	if n < 0 {
+	if n <= 0 {
 		return nil, limiter.ErrInvalidCount
 	}
 	if n > f.limit {
@@ -67,7 +67,7 @@ func (f *FixedWindowCounter) Peek(ctx context.Context, key string) (*limiter.Res
 	r := f.result(w)
 	r.Allowed = r.Remaining >= 1
 	if !r.Allowed {
-		r.RetryAfter = r.ResetAt.Sub(w.Now)
+		r.RetryAfter = positiveDuration(r.ResetAt.Sub(w.Now))
 	}
 	return r, nil
 }
@@ -84,6 +84,9 @@ func (f *FixedWindowCounter) result(w *limiter.WindowResult) *limiter.Result {
 	}
 
 	resetAt := w.WindowStart.Add(f.window)
+	if w.Current == 0 {
+		resetAt = w.Now
+	}
 	r := &limiter.Result{
 		Allowed:   w.Allowed,
 		Limit:     f.limit,
@@ -91,7 +94,24 @@ func (f *FixedWindowCounter) result(w *limiter.WindowResult) *limiter.Result {
 		ResetAt:   resetAt,
 	}
 	if !w.Allowed {
-		r.RetryAfter = resetAt.Sub(w.Now)
+		r.RetryAfter = positiveDuration(w.WindowStart.Add(f.window).Sub(w.Now))
 	}
 	return r
+}
+
+func positiveDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func windowRetention(window time.Duration) time.Duration {
+	if window <= 0 {
+		return 0
+	}
+	if window > (maxDuration-time.Second)/2 {
+		return maxDuration
+	}
+	return 2*window + time.Second
 }
