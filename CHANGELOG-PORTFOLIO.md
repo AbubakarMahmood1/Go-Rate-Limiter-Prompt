@@ -73,7 +73,8 @@ On 2026-07-28, the canonical staged tree passed:
 - required Redis integration tests against Redis 7.4.9; and
 - image plus complete Compose smoke with Docker 29.5.2, including Prometheus scrape, Grafana provisioning, Redis loss, fail-closed responses, and recovery.
 - pinned `govulncheck` v1.6.0 with no reachable symbol or imported-package vulnerabilities; one no-fix notice remains for the unused `x/crypto/openpgp` package.
+- GitHub Actions run [`30363926748`](https://github.com/AbubakarMahmood/go-rate-limiter/actions/runs/30363926748) passed the test, image, and complete Compose jobs for source commit `d14136e7d9208e65711832d5e642581e9f88df46`.
 
 ## Close status
 
-**Local gate complete; GitHub CI pending.** Do not add the close date or final DONE declaration until the published source commit's workflow is observed green.
+**Source and CI gates complete; profile integration pending.** Do not add the final DONE declaration until the profile/resume adoption and repository-pin decision are recorded.

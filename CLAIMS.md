@@ -35,4 +35,6 @@ After the clean verification gate passes, the profile can add:
 
 > CI exercises the race detector, required Redis integration, the container image, Prometheus/Grafana provisioning, and Redis failure/recovery.
 
-Do not add that second sentence before the modified workflow is observed green.
+That sentence is supported by GitHub Actions run
+[`30363926748`](https://github.com/AbubakarMahmood/go-rate-limiter/actions/runs/30363926748)
+for source commit `d14136e7d9208e65711832d5e642581e9f88df46`.

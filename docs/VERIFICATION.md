@@ -90,14 +90,18 @@ The project does not import or call that package; symbol and imported-package
 results were both empty. Every advisory with an available fix in the selected
 build graph was removed by the Go 1.25 dependency refresh.
 
-## Remaining external gate
+## External CI receipt
 
-Publish the source commit and inspect its GitHub Actions workflow. Confirm:
+GitHub Actions run
+[`30363926748`](https://github.com/AbubakarMahmood/go-rate-limiter/actions/runs/30363926748)
+passed for source commit `d14136e7d9208e65711832d5e642581e9f88df46`:
 
-- Redis tests log their target and do not skip;
-- race/build/vet/format are green;
-- image smoke is green; and
-- full Compose smoke reports API, scrape, dashboard, Redis failure, and recovery green.
+- `test`: Go 1.26.5 module verification, pinned vulnerability scan, format,
+  vet, build, complete race suite, and required Redis integration passed;
+- `image`: the built container passed direct HTTP smoke; and
+- `compose`: API, scrape, dashboard, Redis failure, fail-closed behavior, and
+  recovery passed.
 
-Only after that external receipt should `GRIND-CHECKLIST.md` be fully checked
-and `CHANGELOG-PORTFOLIO.md` receive a close date and final DONE declaration.
+The source and CI gates are complete. Profile/resume adoption and the
+repository-pin decision remain separate portfolio-integration work; they do not
+retroactively weaken this source receipt.

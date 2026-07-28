@@ -1,6 +1,6 @@
 # GRIND CHECKLIST — 2026-07
 
-Status: **LOCAL EVIDENCE COMPLETE; GITHUB CI PENDING**
+Status: **SOURCE AND CI EVIDENCE COMPLETE; PROFILE INTEGRATION PENDING**
 
 `[x]` means implemented and observed against the modified source snapshot. `[ ]` means an external publication or CI receipt is still pending.
 
@@ -43,13 +43,14 @@ Status: **LOCAL EVIDENCE COMPLETE; GITHUB CI PENDING**
 - [x] Truthful replacement profile copy recorded in `CLAIMS.md`.
 - [ ] Public profile/portfolio/resume updated after this source branch is merged and evidence is green.
 - [ ] Repository pinned only after the same evidence is green.
-- [ ] GitHub Actions observed green for the published source commit.
+- [x] GitHub Actions observed green for published source commit `d14136e7d9208e65711832d5e642581e9f88df46`.
 
 ## Close-out
 
 - [x] `SPIRIT.md`, `DECISIONS.md`, `RUBRIC.md`, `CLAIMS.md`, and `REGRIND-TRIGGER.md` exist.
 - [x] `CHANGELOG-PORTFOLIO.md` records source changes and reduced claims.
-- [ ] External publication and CI evidence items closed.
+- [x] Source publication and CI evidence items closed.
+- [ ] Profile/resume adoption and repository-pin decision closed.
 - [ ] Add `Closed on YYYY-MM-DD` and the final DONE declaration.
 
 The repository must not be declared DONE while any unchecked item above remains.
