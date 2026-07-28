@@ -39,10 +39,8 @@ jobs:
           go-version: 1.26.5
           cache: true
 
-      - name: Tool versions
-        run: |
-          go version
-          redis-cli --version
+      - name: Go version
+        run: go version
 
       - name: Download and verify modules
         run: |
